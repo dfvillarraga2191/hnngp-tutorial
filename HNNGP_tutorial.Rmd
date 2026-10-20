@@ -1,0 +1,447 @@
+---
+title: "Estimating a Hierarchical Nearest Neighbor Gaussian Process (HNNGP) for Mode Choice with `rstan`"
+author: ""
+date: ""
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    self_contained: true
+    css: tutorial.css
+    math_method:
+      engine: mathjax
+      url: https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml-full.js
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = FALSE,      # set TRUE after installing packages; MCMC is expensive
+  message = FALSE,
+  warning = FALSE,
+  comment = "##",
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 4.5
+)
+```
+
+# Overview
+
+This tutorial walks through estimating a **hierarchical nearest neighbor Gaussian process (HNNGP)** for binary mode choice using **Stan** via **`rstan`**, following Villarraga and Daziano (2025). The example uses the New York City travel-diary data from that paper, comparing **transit** vs **driving**, with a spatially correlated latent utility approximated by an NNGP.
+
+You will:
+
+1. Prepare covariates and spatial coordinates  
+2. Build the nearest-neighbor (NN) index used by the NNGP  
+3. Specify priors and assemble the Stan data list  
+4. Fit the model with `rstan`  
+5. Summarize posteriors (including value of time)  
+6. Compute **effective sample size (ESS)** and **Gelman–Rubin $\widehat{R}$** with the same approach as in `ess_rhats.R`
+
+::: {.callout}
+**Runtime note.** Full MCMC on ~2,400 observations with $M=20$ neighbors and 4 chains × 3,000 iterations is computationally heavy. For a first run, subsample the data (e.g. 300–500 rows) or reduce `iter`.
+:::
+
+# Model
+
+For observation $i = 1,\ldots,N$, let $Y_i \in \{0,1\}$ indicate transit ($1$) vs driving ($0$). Conditional on a latent utility $u_i$,
+
+\[
+Y_i \mid u_i \sim \mathrm{Bernoulli}\bigl(\mathrm{logit}^{-1}(u_i)\bigr).
+\]
+
+The latent field follows a Gaussian process regression mean with exponential correlation, with nugget variance fixed at $\tau^2 = 1$ in the Stan program:
+
+\[
+\mathbf{u} \sim \mathcal{N}\bigl(X\beta,\; \sigma^2 R(\phi) + \tau^2 I\bigr),
+\]
+
+where $R(\phi)_{ij} = \exp(-\phi\,\|s_i - s_j\|)$ and $s_i$ are spatial coordinates. A dense GP is $O(N^3)$; the **NNGP** replaces the full covariance with a sparse approximation based on $M$ nearest neighbors (Datta et al., 2016; Finley et al.), which Stan evaluates through a custom `nngp` likelihood. The binary mode-choice specification, priors, and New York City application follow Villarraga and Daziano (2025).
+
+In this tutorial the coordinates are **trip directions** (destination minus origin lat/lon), so nearby observations in covariate space share similar origin–destination orientations.
+
+Priors used below:
+
+- $\beta \sim \mathcal{N}(\mu_\beta, V_\beta)$  
+- $\sigma \sim \mathcal{N}^+(1, s_\sigma)$ (truncated via `<lower=0>`)  
+- $\phi \sim \mathrm{Gamma}(a_\phi, b_\phi)$
+
+Training vs held-out observations are handled with a binary `mask`: only `mask[n] == 1` contributes to the Bernoulli likelihood, while the GP is defined for all $N$ locations.
+
+# Software setup
+
+```{r packages}
+install.packages(c(
+  "rstan", "spNNGP", "tidyverse", "HDInterval",
+  "ggridges", "loo", "sns", "asbio"
+))
+# On macOS you need a working C++ toolchain (Xcode CLT) for rstan.
+```
+
+```{r libraries}
+library(rstan)
+library(tidyverse)
+library(HDInterval)
+library(ggridges)
+library(loo)
+
+source("R/NNMatrix.R")   # builds NN indices via spNNGP::spConjNNGP
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+```
+
+# Data preparation
+
+Load the binary mode-choice file and construct the design matrix.
+
+```{r load-data}
+my_data <- read.csv(
+  "data/mode_binary.csv",
+  header = TRUE, sep = ",", dec = ".", check.names = FALSE
+)
+my_data <- my_data[complete.cases(my_data), ]
+
+# Outcome: transit (PMODE_R3 == 2) vs driving
+y    <- as.integer(my_data$PMODE_R3 == 2)
+male <- as.integer(my_data$GENDER == "Male")
+t    <- (my_data$T_Transit - my_data$T_Driving) / 60  # hours
+c    <- my_data$Cost_Transit - my_data$Cost_Driving   # USD
+veh  <- as.integer(my_data$HHVEH_R == 0)              # no household vehicle
+hinc <- as.integer(my_data$INCOM_R == 4)              # high income
+manh <- as.integer(my_data$GEO_GROUP1_D == 1)         # Manhattan destination
+
+s_o <- my_data[, c("INTPTLAT", "INTPTLONG")]
+s_d <- my_data[, c("DLAT", "DLONG")]
+s   <- as.matrix(s_d - s_o)   # trip direction
+
+X <- cbind(1, t, c, veh, hinc, manh, male)
+colnames(X) <- c("asc", "time", "cost", "no_veh", "high_inc", "manhattan", "male")
+N <- nrow(X)
+
+# Optional demo subsample
+# set.seed(42); keep <- sample(N, 400)
+# y <- y[keep]; X <- X[keep, ]; s <- s[keep, ]; N <- nrow(X)
+
+train_prop <- 0.8
+set.seed(42)
+mask <- sample(c(1L, 0L), N, replace = TRUE,
+               prob = c(train_prop, 1 - train_prop))
+
+table(y)
+mean(mask)   # ~ training fraction
+```
+
+Covariates enter utility as differences (transit − driving) for time and cost, plus socioeconomic indicators that shift the transit ASC.
+
+# Nearest-neighbor matrix
+
+The helper `NNMatrix()` (in `R/NNMatrix.R`) uses `spNNGP` to order locations and return neighbor indices and distances required by the Stan NNGP density.
+
+```{r nn-matrix}
+M <- 20   # number of neighbors
+NN.matrix <- NNMatrix(
+  coords = s,
+  n.neighbors = M,
+  n.omp.threads = 2,
+  ord = order(s[, 1])   # order along first coordinate axis
+)
+str(NN.matrix, max.level = 1)
+```
+
+Returned objects:
+
+| Object | Role in Stan |
+|--------|----------------|
+| `ord` | Permutation used to sort `Y` and `X` |
+| `NN_ind` | Neighbor indices for locations $2,\ldots,N$ |
+| `NN_dist` | Distances to those neighbors |
+| `NN_distM` | Packed pairwise distances among neighbors |
+
+**Important:** `Y`, `X`, and `mask` must be sorted with `NN.matrix$ord` before calling Stan.
+
+You can visually check neighbors for observation `ind` with `Check_Neighbors(NN.matrix$coords.ord, M, NN.matrix, ind)`.
+
+# Priors and Stan data list
+
+```{r priors}
+P  <- ncol(X) - 1
+uB <- rep(0, P + 1)
+uB[4] <- 3.42          # prior mean for no-vehicle coefficient
+VB <- diag(P + 1)      # prior covariance for beta
+ss <- 0.5              # scale for sigma ~ Normal(1, ss)
+st <- 0.001            # placeholder (tausq is fixed in Stan)
+ap <- 3; bp <- 0.5     # phi ~ Gamma(ap, bp)
+
+stan_data <- list(
+  N = N, M = M, P = P,
+  Y = y[NN.matrix$ord],
+  X = X[NN.matrix$ord, , drop = FALSE],
+  NN_ind  = NN.matrix$NN_ind,
+  NN_dist = NN.matrix$NN_dist,
+  NN_distM = NN.matrix$NN_distM,
+  mask = mask[NN.matrix$ord],
+  uB = uB, VB = VB, ss = ss, st = st, ap = ap, bp = bp
+)
+```
+
+# Stan program (binary HNNGP)
+
+The model file is `stan/nngp_binary.stan`. Conceptually:
+
+```stan
+parameters {
+  vector[P + 1] beta;
+  vector[N] u;
+  real<lower=0> sigma;
+  real<lower=0> phi;
+}
+transformed parameters {
+  real sigmasq = square(sigma);
+}
+model {
+  beta  ~ multi_normal_cholesky(uB, L_VB);
+  phi   ~ gamma(ap, bp);
+  sigma ~ normal(1, ss);
+  u ~ nngp(X * beta, sigmasq, tausq, phi,
+           NN_dist, NN_distM, NN_ind, N, M);
+  for (n in 1:N) {
+    if (mask[n] == 1)
+      Y[n] ~ bernoulli_logit(u[n]);
+  }
+}
+```
+
+The custom `nngp_lpdf` implements the NNGP sparse precision factorization using the neighbor distances and exponential kernel $e^{-\phi d}$.
+
+# Fitting with `rstan`
+
+```{r fit}
+parameters <- c("beta", "sigmasq", "phi", "log_lik", "y_est")
+
+fit <- stan(
+  file = "stan/nngp_binary.stan",
+  data = stan_data,
+  pars = parameters,
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  refresh = 50
+)
+
+print(fit, pars = c("beta", "sigmasq", "phi"), probs = c(0.025, 0.5, 0.975))
+dir.create("results", showWarnings = FALSE)
+saveRDS(fit, "results/hnngp_binary_fit.rds")
+```
+
+Coefficient mapping:
+
+| Stan | Interpretation |
+|------|----------------|
+| `beta[1]` | ASC (transit) |
+| `beta[2]` | Time difference (hours) |
+| `beta[3]` | Cost difference (USD) |
+| `beta[4]` | No household vehicle |
+| `beta[5]` | High income |
+| `beta[6]` | Manhattan destination |
+| `beta[7]` | Male |
+| `sigmasq` | Spatial variance $\sigma^2$ |
+| `phi` | Exponential decay |
+
+# Posterior summaries
+
+Extract draws and report means, medians, and 95% highest-density intervals (HDIs).
+
+```{r post-summaries}
+post <- rstan::extract(fit, pars = c("beta", "sigmasq", "phi"))
+warmup_drop <- 1000  # if pulling from @sim$samples manually
+
+summarize_draws <- function(x, name) {
+  h <- unname(hdi(x, credMass = 0.95))
+  tibble(
+    parameter = name,
+    mean = mean(x),
+    median = median(x),
+    hdi_low = h[1],
+    hdi_high = h[2]
+  )
+}
+
+par_names <- c("ASC", "time", "cost", "no_veh", "high_inc", "manhattan", "male")
+beta_tab <- bind_rows(lapply(seq_along(par_names), function(j) {
+  summarize_draws(post$beta[, j], par_names[j])
+}))
+bind_rows(
+  beta_tab,
+  summarize_draws(post$sigmasq, "sigmasq"),
+  summarize_draws(post$phi, "phi")
+)
+```
+
+## Value of time (VOT)
+
+With time in hours and cost in USD,
+
+\[
+\mathrm{VOT} = 60 \times \frac{\beta_t}{\beta_c} \quad [\mathrm{USD/hr}].
+\]
+
+```{r vot}
+vot <- (post$beta[, 2] / post$beta[, 3]) * 60
+summarize_draws(vot, "VOT (USD/hr)")
+```
+
+## Trace plots
+
+```{r traces, fig.height=7}
+p <- plot(
+  fit, plotfun = "trace",
+  pars = c("beta[1]", "beta[2]", "beta[3]", "beta[4]",
+           "beta[5]", "beta[6]", "beta[7]", "sigmasq", "phi"),
+  inc_warmup = TRUE
+)
+p
+```
+
+## Density / HDI ridge plot (example: cost)
+
+```{r hdi-cost, fig.height=4}
+bc <- as.numeric(post$beta[, 3])
+hdi_bc <- unname(hdi(bc, credMass = 0.95))
+
+ggplot(tibble(bc), aes(x = bc, y = 0, fill = after_stat(quantile))) +
+  geom_density_ridges_gradient(
+    quantile_lines = TRUE, quantile_fun = hdi,
+    vline_linetype = 5, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = c("transparent", "lightblue", "transparent")) +
+  labs(
+    title = "95% HDI for the cost coefficient",
+    x = expression(beta[c]), y = "density"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Predictive check on held-out cases
+
+`y_est` are posterior predictive draws of $Y$. A simple accuracy measure uses the posterior mode on test rows (`mask == 0`).
+
+```{r test-acc}
+get_mode <- function(x) {
+  ux <- table(x)
+  as.integer(names(ux)[which.max(ux)])
+}
+
+y_ord <- y[NN.matrix$ord]
+mask_ord <- mask[NN.matrix$ord]
+y_est <- rstan::extract(fit, "y_est")$y_est  # iterations x N
+
+test_idx <- which(mask_ord == 0)
+pred_mode <- apply(y_est[, test_idx, drop = FALSE], 2, get_mode)
+test_acc <- mean(pred_mode == y_ord[test_idx])
+test_acc
+```
+
+## PSIS-LOO (optional)
+
+```{r loo}
+loo(fit)
+```
+
+# MCMC diagnostics: ESS and $\widehat{R}$
+
+After sampling, check that chains mixed and that you have enough effective draws. The script `R/ess_rhats.R` mirrors the original `ess_rhats.R` workflow: for each parameter, sum chain-wise **ESS** from `sns::ess(..., method = c("coda", "ise"))` and compute **$\widehat{R}$** with `asbio::R.hat` on the matrix of post-warmup draws.
+
+```{r ess-rhat}
+library(sns)
+library(asbio)
+
+iterations <- 3000
+warmup     <- 1000
+post_start <- warmup + 1
+
+c1 <- fit@sim[["samples"]][[1]]
+c2 <- fit@sim[["samples"]][[2]]
+c3 <- fit@sim[["samples"]][[3]]
+c4 <- fit@sim[["samples"]][[4]]
+
+par_list <- c(
+  "beta[1]", "beta[2]", "beta[3]", "beta[4]",
+  "beta[5]", "beta[6]", "beta[7]",
+  "sigmasq", "phi"
+)
+
+ess_rhat <- lapply(par_list, function(par) {
+  posts <- list(
+    c1[[par]][post_start:iterations],
+    c2[[par]][post_start:iterations],
+    c3[[par]][post_start:iterations],
+    c4[[par]][post_start:iterations]
+  )
+  ess_total <- sum(vapply(posts, function(z) ess(z, method = c("coda", "ise")), numeric(1)))
+  rhat <- R.hat(do.call(cbind, posts))
+  data.frame(parameter = par, ESS = ess_total, R_hat = rhat)
+})
+ess_rhat <- do.call(rbind, ess_rhat)
+ess_rhat
+```
+
+Or simply, after `fit` exists:
+
+```{r source-ess}
+source("R/ess_rhats.R")
+```
+
+### How to read the diagnostics
+
+- **$\widehat{R}$ (Gelman–Rubin):** values close to **1** (commonly $< 1.01$ or at least $< 1.05$) indicate chain agreement. Large $\widehat{R}$ means you should run longer, reparameterize, or check for multimodality / identification issues.  
+- **ESS:** effective independent draws after accounting for autocorrelation. Higher is better; very low ESS relative to the number of post-warmup draws signals sticky sampling. Report ESS alongside posterior means and intervals.
+
+These two quantities complement Stan’s built-in `summary(fit)` (which also reports `n_eff` and `Rhat` using the Stan/rstan definitions). The `sns` / `asbio` versions match the diagnostics workflow in Villarraga and Daziano (2025) and in `ess_rhats.R` when you need that specific implementation.
+
+# Repository layout
+
+```text
+hnngp-tutorial/
+├── README.md
+├── HNNGP_tutorial.Rmd          # this tutorial (source)
+├── docs/
+│   ├── HNNGP_tutorial.html     # website-ready HTML
+│   └── tutorial.css
+├── data/
+│   └── mode_binary.csv
+├── R/
+│   ├── NNMatrix.R              # neighbor construction
+│   └── ess_rhats.R             # ESS and R-hat
+├── stan/
+│   └── nngp_binary.stan        # binary HNNGP
+└── scripts/
+    └── fit_hnngp.R             # end-to-end script
+```
+
+From the `hnngp-tutorial/` directory:
+
+```r
+source("scripts/fit_hnngp.R")
+```
+
+# References (selected)
+
+- Villarraga, D. F., & Daziano, R. A. (2025). Hierarchical Nearest Neighbor Gaussian Process models for discrete choice: Mode choice in New York City. *Transportation Research Part B: Methodological*, 191, 103132. <https://doi.org/10.1016/j.trb.2024.103132>  
+- Datta, A., Banerjee, S., Finley, A. O., & Gelfand, A. E. (2016). Hierarchical Nearest-Neighbor Gaussian Process models for large geostatistical datasets. *Journal of the American Statistical Association*, 111(514), 800–812.  
+- Finley, A. O., Datta, A., & Banerjee, S. — `spNNGP` R package.  
+- Stan Development Team — Stan / `rstan` User’s Guide (NUTS, diagnostics).  
+- Gelman, A., & Rubin, D. B. (1992). Inference from iterative simulation using multiple sequences. *Statistical Science*.
+
+# Session info
+
+```{r session, eval=TRUE}
+sessionInfo()
+```

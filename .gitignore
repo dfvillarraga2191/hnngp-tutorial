@@ -1,0 +1,10 @@
+results/
+.Rhistory
+.RData
+.RDataTmp
+.RData*
+.Rproj.user
+*_cache/
+*_files/
+.DS_Store
+*.rds
